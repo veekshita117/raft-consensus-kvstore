@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  node1:
+    build: .
+    container_name: node1
+    command: ["--id", "1", "--port", "8001", "--peers", "2:node2:8002,3:node3:8003"]
+    ports:
+      - "8001:8001"
+    networks:
+      - raft-net
+    restart: always
+
+  node2:
+    build: .
+    container_name: node2
+    command: ["--id", "2", "--port", "8002", "--peers", "1:node1:8001,3:node3:8003"]
+    ports:
+      - "8002:8002"
+    networks:
+      - raft-net
+    restart: always
+
+  node3:
+    build: .
+    container_name: node3
+    command: ["--id", "3", "--port", "8003", "--peers", "1:node1:8001,2:node2:8002"]
+    ports:
+      - "8003:8003"
+    networks:
+      - raft-net
+    restart: always
+
+networks:
+  raft-net:
+    driver: bridge
