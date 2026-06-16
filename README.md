@@ -183,3 +183,16 @@ Get Success: true, Value: testValue, Message: Key found
 ```log
 2026/06/16 22:05:48 [Node 2] Forwarding Get request to Leader 1
 ```
+## Known Limitations & Future Scope
+
+### 1. Log Compaction & Snapshotting (Raft §7)
+* **Limitation**: Logs grow unboundedly in memory. A restarted or heavily lagging node must replay the entire log history entry-by-entry from the leader to catch up.
+* **Future Scope**: Implement checkpoint snapshotting to periodically serialize the KV-store state to disk and truncate old logs, enabling instant state transfers.
+
+### 2. Startup Initialization Safety
+* **Limitation**: The disk-restore function (`readPersistedState`) reads the JSON state file on startup without holding the mutex lock. It is safe during sequential bootstrap before listeners start, but introduces a latent data race if refactored into runtime logic later.
+* **Future Scope**: Wrap the initialization sequence inside explicit lock/unlock blocks to ensure absolute, future-proof thread safety.
+
+### 3. Static Cluster Membership (Raft §6)
+* **Limitation**: The cluster configuration is static, requiring fixed peer network configurations at boot. Adding or removing nodes dynamically without cluster downtime is unsupported.
+* **Future Scope**: Implement Raft joint consensus to allow dynamic, online cluster resizing and membership changes.
