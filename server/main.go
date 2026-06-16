@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,11 @@ type peer struct {
 	kvClient   pb.KVStoreClient
 }
 
+type RaftState struct {
+	CurrentTerm int32 `json:"currentTerm"`
+	VotedFor    int32 `json:"votedFor"`
+}
+
 type server struct {
 	pb.UnimplementedKVStoreServer
 	pb.UnimplementedRaftServiceServer
@@ -48,13 +54,14 @@ type server struct {
 	port string
 	kv   *store.KVStore
 
-	mu            sync.Mutex
-	peers         map[int]*peer
-	role          Role
-	currentTerm   int32
-	votedFor      int32
-	leaderId      int
-	lastResetTime time.Time
+	mu              sync.Mutex
+	peers           map[int]*peer
+	role            Role
+	currentTerm     int32
+	votedFor        int32
+	leaderId        int
+	lastResetTime   time.Time
+	electionTimeout time.Duration
 
 	// Raft State Logs & Commit Pointers
 	log         []*pb.LogEntry
@@ -123,9 +130,24 @@ func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, 
 }
 
 func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	// Reads can be satisfied locally from the state machine of any node (as per spec: "Create an in-memory key-value state machine supporting basic GET").
-	// To prevent dirty reads from stale state machines, we can read locally, or forward to the leader.
-	// For simplicity and standard Go map accesses, reading locally is thread-safe and correct.
+	s.mu.Lock()
+	if s.role != Leader {
+		leaderId := s.leaderId
+		s.mu.Unlock()
+		if leaderId == -1 {
+			return &pb.GetResponse{Value: "", Found: false, Message: "No active leader in cluster"}, nil
+		}
+		s.mu.Lock()
+		p, exists := s.peers[leaderId]
+		s.mu.Unlock()
+		if !exists {
+			return &pb.GetResponse{Value: "", Found: false, Message: fmt.Sprintf("Leader %d connection not found", leaderId)}, nil
+		}
+		log.Printf("[Node %d] Forwarding Get request to Leader %d", s.id, leaderId)
+		return p.kvClient.Get(ctx, req)
+	}
+	s.mu.Unlock()
+
 	log.Printf("[Node %d] Get key: %q", s.id, req.Key)
 	val, exists := s.kv.Get(req.Key)
 	if !exists {
@@ -197,6 +219,51 @@ func (s *server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 	}, nil
 }
 
+// must be called with s.mu held
+func (s *server) resetElectionTimeout() {
+	s.lastResetTime = time.Now()
+	s.electionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
+}
+
+// must be called with s.mu held
+func (s *server) persistState() {
+	state := RaftState{
+		CurrentTerm: s.currentTerm,
+		VotedFor:    s.votedFor,
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		log.Printf("[Node %d] Error marshaling state: %v", s.id, err)
+		return
+	}
+	filename := fmt.Sprintf("raft_state_%d.json", s.id)
+	err = os.WriteFile(filename, data, 0644)
+	if err != nil {
+		log.Printf("[Node %d] Error writing state to file: %v", s.id, err)
+	}
+}
+
+// must be called during initialization before starting listeners
+func (s *server) readPersistedState() {
+	filename := fmt.Sprintf("raft_state_%d.json", s.id)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		log.Printf("[Node %d] Error reading state file: %v", s.id, err)
+		return
+	}
+	var state RaftState
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("[Node %d] Error unmarshaling persisted state: %v", s.id, err)
+		return
+	}
+	s.currentTerm = state.CurrentTerm
+	s.votedFor = state.VotedFor
+	log.Printf("[Node %d] Restored state from disk: currentTerm=%d, votedFor=%d", s.id, s.currentTerm, s.votedFor)
+}
+
 // RequestVote RPC handler
 func (s *server) RequestVote(ctx context.Context, req *pb.RequestVoteArgs) (*pb.RequestVoteReply, error) {
 	s.mu.Lock()
@@ -228,7 +295,8 @@ func (s *server) RequestVote(ctx context.Context, req *pb.RequestVoteArgs) (*pb.
 
 	if (s.votedFor == -1 || s.votedFor == req.CandidateId) && logUpToDate {
 		s.votedFor = req.CandidateId
-		s.lastResetTime = time.Now()
+		s.resetElectionTimeout()
+		s.persistState()
 		log.Printf("[Node %d] Granted vote to Candidate %d for Term %d", s.id, req.CandidateId, req.Term)
 		return &pb.RequestVoteReply{
 			Term:        s.currentTerm,
@@ -260,13 +328,28 @@ func (s *server) AppendEntries(ctx context.Context, req *pb.AppendEntriesArgs) (
 	}
 
 	s.leaderId = int(req.LeaderId)
-	s.lastResetTime = time.Now() // Reset election timer
+	s.resetElectionTimeout()
 
 	// Validate prevLogIndex & prevLogTerm
-	if int(req.PrevLogIndex) >= len(s.log) || s.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+	if int(req.PrevLogIndex) >= len(s.log) {
 		return &pb.AppendEntriesReply{
-			Term:    s.currentTerm,
-			Success: false,
+			Term:          s.currentTerm,
+			Success:       false,
+			ConflictTerm:  -1,
+			ConflictIndex: int32(len(s.log)),
+		}, nil
+	}
+	if s.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+		conflictTerm := s.log[req.PrevLogIndex].Term
+		conflictIndex := req.PrevLogIndex
+		for conflictIndex > 0 && s.log[conflictIndex-1].Term == conflictTerm {
+			conflictIndex--
+		}
+		return &pb.AppendEntriesReply{
+			Term:          s.currentTerm,
+			Success:       false,
+			ConflictTerm:  conflictTerm,
+			ConflictIndex: int32(conflictIndex),
 		}, nil
 	}
 
@@ -317,7 +400,8 @@ func (s *server) stepDown(newTerm int32) {
 	s.currentTerm = newTerm
 	s.votedFor = -1
 	s.leaderId = -1
-	s.lastResetTime = time.Now()
+	s.resetElectionTimeout()
+	s.persistState()
 	s.commitCond.Broadcast()
 }
 
@@ -345,7 +429,8 @@ func (s *server) startElection() {
 	s.role = Candidate
 	s.currentTerm++
 	s.votedFor = int32(s.id)
-	s.lastResetTime = time.Now()
+	s.resetElectionTimeout()
+	s.persistState()
 
 	term := s.currentTerm
 	candidateId := s.id
@@ -386,7 +471,8 @@ func (s *server) startElection() {
 
 				log.Printf("[Node %d] Received vote from Peer %d, total votes: %d", candidateId, pID, totalVotes)
 
-				if totalVotes >= 2 {
+				quorum := (len(s.peers) + 1)/2 + 1
+				if totalVotes >= quorum {
 					s.becomeLeader()
 				}
 			}
@@ -395,17 +481,24 @@ func (s *server) startElection() {
 }
 
 func (s *server) electionLoop() {
-	for {
-		timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
-		time.Sleep(timeout)
+	s.mu.Lock()
+	s.resetElectionTimeout()
+	s.mu.Unlock()
 
-		s.mu.Lock()
-		if s.role != Leader {
-			if time.Since(s.lastResetTime) >= timeout {
-				s.startElection()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.mu.Lock()
+			if s.role != Leader {
+				if time.Since(s.lastResetTime) >= s.electionTimeout {
+					s.startElection()
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -505,8 +598,24 @@ func (s *server) sendHeartbeats(term int32) {
 					s.matchIndex[r.pID] = r.prevLogIndex + len(r.entries)
 					s.updateLeaderCommitIndex()
 				} else {
-					if s.nextIndex[r.pID] > 1 {
-						s.nextIndex[r.pID]--
+					if reply.ConflictTerm == -1 {
+						s.nextIndex[r.pID] = int(reply.ConflictIndex)
+					} else {
+						lastIndexForTerm := -1
+						for idx := len(s.log) - 1; idx >= 0; idx-- {
+							if s.log[idx].Term == reply.ConflictTerm {
+								lastIndexForTerm = idx
+								break
+							}
+						}
+						if lastIndexForTerm != -1 {
+							s.nextIndex[r.pID] = lastIndexForTerm + 1
+						} else {
+							s.nextIndex[r.pID] = int(reply.ConflictIndex)
+						}
+					}
+					if s.nextIndex[r.pID] < 1 {
+						s.nextIndex[r.pID] = 1
 					}
 				}
 			}
@@ -523,7 +632,8 @@ func (s *server) updateLeaderCommitIndex() {
 	}
 
 	sort.Ints(matches)
-	N := matches[len(matches)/2]
+	quorum := (len(s.peers) + 1)/2 + 1
+	N := matches[len(matches)-quorum]
 
 	if N > s.commitIndex && s.log[N].Term == s.currentTerm {
 		log.Printf("[Node %d] Leader updated commitIndex from %d to %d", s.id, s.commitIndex, N)
@@ -652,6 +762,9 @@ func main() {
 		lastApplied: 0,
 	}
 	srv.commitCond = sync.NewCond(&srv.mu)
+
+	// Restore persisted state from file if it exists
+	srv.readPersistedState()
 
 	peerAddrs, err := parsePeers(*peersStr)
 	if err != nil {
