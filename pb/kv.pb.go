@@ -593,6 +593,8 @@ type AppendEntriesReply struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          int32                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	ConflictTerm  int32                  `protobuf:"varint,3,opt,name=conflictTerm,proto3" json:"conflictTerm,omitempty"`
+	ConflictIndex int32                  `protobuf:"varint,4,opt,name=conflictIndex,proto3" json:"conflictIndex,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -641,6 +643,20 @@ func (x *AppendEntriesReply) GetSuccess() bool {
 	return false
 }
 
+func (x *AppendEntriesReply) GetConflictTerm() int32 {
+	if x != nil {
+		return x.ConflictTerm
+	}
+	return 0
+}
+
+func (x *AppendEntriesReply) GetConflictIndex() int32 {
+	if x != nil {
+		return x.ConflictIndex
+	}
+	return 0
+}
+
 var File_pb_kv_proto protoreflect.FileDescriptor
 
 const file_pb_kv_proto_rawDesc = "" +
@@ -683,10 +699,12 @@ const file_pb_kv_proto_rawDesc = "" +
 	"\bLogEntry\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x05R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x05R\x05index\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\tR\acommand\"B\n" +
+	"\acommand\x18\x03 \x01(\tR\acommand\"\x8c\x01\n" +
 	"\x12AppendEntriesReply\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x05R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess2\xa8\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\"\n" +
+	"\fconflictTerm\x18\x03 \x01(\x05R\fconflictTerm\x12$\n" +
+	"\rconflictIndex\x18\x04 \x01(\x05R\rconflictIndex2\xa8\x01\n" +
 	"\aKVStore\x120\n" +
 	"\x03Put\x12\x13.kvstore.PutRequest\x1a\x14.kvstore.PutResponse\x120\n" +
 	"\x03Get\x12\x13.kvstore.GetRequest\x1a\x14.kvstore.GetResponse\x129\n" +

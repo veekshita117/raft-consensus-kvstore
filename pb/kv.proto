@@ -76,4 +76,6 @@ message LogEntry {
 message AppendEntriesReply {
   int32 term = 1;
   bool success = 2;
+  int32 conflictTerm = 3;
+  int32 conflictIndex = 4;
 }
