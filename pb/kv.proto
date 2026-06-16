@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package kvstore;
+
+option go_package = "github.com/raft-kv/pb";
+
+// KVStore defines the basic CRUD operations for the state machine
+service KVStore {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message PutResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  string value = 1;
+  bool found = 2;
+  string message = 3;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// RaftService defines the core RPCs used for cluster consensus
+service RaftService {
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+}
+
+message RequestVoteArgs {
+  int32 term = 1;
+  int32 candidateId = 2;
+  int32 lastLogIndex = 3;
+  int32 lastLogTerm = 4;
+}
+
+message RequestVoteReply {
+  int32 term = 1;
+  bool voteGranted = 2;
+}
+
+message AppendEntriesArgs {
+  int32 term = 1;
+  int32 leaderId = 2;
+  int32 prevLogIndex = 3;
+  int32 prevLogTerm = 4;
+  repeated LogEntry entries = 5;
+  int32 leaderCommit = 6;
+}
+
+message LogEntry {
+  int32 term = 1;
+  int32 index = 2;
+  string command = 3; // e.g. serialized PUT/DELETE command
+}
+
+message AppendEntriesReply {
+  int32 term = 1;
+  bool success = 2;
+}
