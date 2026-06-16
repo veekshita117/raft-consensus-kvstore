@@ -6,7 +6,7 @@ A production-grade, distributed, consensus-based key-value store implemented in 
 
 ## Architecture Overview
 
-```
+```text
                       +-------------------+
                       |    Client CLI     |
                       +-------------------+
@@ -38,21 +38,46 @@ A production-grade, distributed, consensus-based key-value store implemented in 
 ```
 
 ### Component Details
-1. **Client CLI**: Allows clients to execute mutations (PUT/DELETE) and queries (GET) against any cluster node.
+
+1. **Client CLI**: Allows clients to execute mutations (`PUT`/`DELETE`) and queries (`GET`) against any cluster node.
 2. **Follower Proxy**: Non-leader nodes intercept write commands and automatically forward them to the current Leader, achieving full write-transparency.
 3. **Consensus Engine**: Implemented via Raft election states, term increments, randomized timeouts (150ms-300ms), and 50ms heartbeat tickers.
 4. **Log Replication**: Ensures all writes are written to a quorum of nodes (2 out of 3) before committing and executing them on the thread-safe `KVStore` state machine.
 
 ---
 
+## System Specifications
+
+### Protocol Rules & Constraints
+
+- **Language & Runtime**: Go (Golang) utilizing clean, idiomatic concurrency patterns.
+- **Communication Layer**: High-performance gRPC and Protocol Buffers (`.proto`). No raw TCP sockets.
+- **Cluster Topography**: 3 separate node instances running locally via network loops over specific assignments (ports: `8001`, `8002`, `8003`).
+
+### Core State Variables (Per-Node)
+
+- `currentTerm`: Latest term server has seen (initialized to `0`).
+- `votedFor`: Candidate ID that received a vote in the current term (or null/unset).
+- `log[]`: Log entries containing state machine mutation commands and the matching term metadata when received.
+- `commitIndex`: Index of the highest log entry known by the node to be committed.
+- `role`: State assignment indicator tracking whether a node is a Follower, Candidate, or Leader.
+
+### Implementation Guardrails
+
+- **Concurrency Primitives**: Absolute memory safety achieved by isolating all internal state variable adjustments behind a mutual exclusion lock (`sync.Mutex`).
+- **Split-Brain Mitigation**: Randomized election tickers set explicitly between 150ms–300ms per instance to maximize variance and mitigate vote splits.
+- **Authority Maintenance**: Active leaders generate and dispatch `AppendEntries` RPC heartbeats strictly every 50ms to suppress follower timeouts.
+
+---
+
 ## Directory Structure
 
-```
-├── client/          # CLI implementation for testing cluster actions
-├── pb/              # Protobuf file and Go compiled gRPC stubs
-├── server/          # Core Raft state machine and gRPC server
-├── store/           # Thread-safe in-memory key-value database
-├── Dockerfile       # Multi-stage optimized production builder
+```text
+├── client/            # CLI implementation for testing cluster actions
+├── pb/                # Protobuf file and Go compiled gRPC stubs
+├── server/            # Core Raft state machine and gRPC server
+├── store/             # Thread-safe in-memory key-value database
+├── Dockerfile         # Multi-stage optimized production builder
 └── docker-compose.yml # 3-node container orchestration spec
 ```
 
@@ -61,95 +86,78 @@ A production-grade, distributed, consensus-based key-value store implemented in 
 ## Quickstart
 
 ### Prerequisites
-- Go 1.20+
-- Docker & Docker Compose (optional)
 
-### Method 1: Local Launch (Pre-compiled)
+- Go 1.22+
+- Docker Engine & Docker Compose V2
+
+### Method 1: Local Native Launch
+
 1. **Build the server and client binaries**:
    ```bash
-   go build -o kv-server ./server
-   go build -o kv-client ./client
+   go build -o kv-server ./server/main.go
+   go build -o kv-client ./client/main.go
    ```
 
-2. **Start the 3 local nodes in separate terminal windows (or background)**:
-   ```bash
-   ./kv-server --id 1 --port 8001 --peers "2:localhost:8002,3:localhost:8003" > node1.log 2>&1 &
-   ./kv-server --id 2 --port 8002 --peers "1:localhost:8001,3:localhost:8003" > node2.log 2>&1 &
-   ./kv-server --id 3 --port 8003 --peers "1:localhost:8001,2:localhost:8002" > node3.log 2>&1 &
-   ```
+2. **Start the 3 local nodes in separate terminal windows**:
+   - **Terminal 1**:
+     ```bash
+     ./kv-server --id 1 --port 8001 --peers "2:localhost:8002,3:localhost:8003"
+     ```
+   - **Terminal 2**:
+     ```bash
+     ./kv-server --id 2 --port 8002 --peers "1:localhost:8001,3:localhost:8003"
+     ```
+   - **Terminal 3**:
+     ```bash
+     ./kv-server --id 3 --port 8003 --peers "1:localhost:8001,2:localhost:8002"
+     ```
 
 3. **Verify the cluster using the client**:
-   - Write to the leader node:
+   - Write to the cluster leader node:
      ```bash
-     ./kv-client --addr localhost:8003 put appKey appValue
+     ./kv-client --addr localhost:8002 put raftKey raftValue
      ```
-   - Fetch the value from a follower node:
+   - Fetch the value from a follower node to verify consensus replication:
      ```bash
-     ./kv-client --addr localhost:8001 get appKey
+     ./kv-client --addr localhost:8001 get raftKey
      ```
 
 ### Method 2: Docker Compose Orchestration
+
 1. **Start the cluster**:
    ```bash
-   docker-compose up --build
+   sudo docker compose up --build
    ```
-   This will spin up three containerized server nodes mapping host ports `8001`, `8002`, and `8003` to the cluster on an isolated bridge network.
 
 2. **Execute commands using the client**:
    ```bash
-   go build -o kv-client ./client
    ./kv-client --addr localhost:8001 put dockerKey dockerValue
-   ./kv-client --addr localhost:8002 get dockerKey
+   ./kv-client --addr localhost:8003 get dockerKey
    ```
 
 ---
 
 ## Verification Logs
 
-Below are real logs and terminal outputs captured during the verification phases:
+### 1. Leader Election
 
-### 1. Leader Election (Term 1)
-When the nodes boot up, they start in `Follower` state. Node 3 times out first, starts an election, gets votes from Node 1 and Node 2, and becomes Leader:
 ```log
-# Node 3 Logs:
-2026/06/16 15:38:13 [Node 3] Started election for Term 1
-2026/06/16 15:38:13 [Node 3] Received vote from Peer 1, total votes: 2
-2026/06/16 15:38:13 [Node 3] Became Leader for Term 1!
-
-# Node 1 Logs:
-2026/06/16 15:38:13 [Node 1] Received RequestVote from Candidate 3 for Term 1. Local Term: 0, votedFor: -1
-2026/06/16 15:38:13 [Node 1] Stepping down to Follower. Term: 0 -> 1
-2026/06/16 15:38:13 [Node 1] Granted vote to Candidate 3 for Term 1
+2026/06/16 16:56:35 [Node 2] Started election for Term 60
+2026/06/16 16:56:35 [Node 2] Received vote from Peer 1, total votes: 2
+2026/06/16 16:56:35 [Node 2] Became Leader for Term 60!
 ```
 
-### 2. Client Proxy Forwarding & Log replication
-A client sends a `PUT` command to Node 1 (a Follower). Node 1 forwards it to Node 3 (the Leader). The Leader appends, replicates it, and commits:
-```log
-# Client output:
-$ ./kv-client --addr localhost:8001 put forwardedKey forwardedValue
+### 2. Client Proxy Forwarding & Log Replication
+
+**Client command & output:**
+```bash
+$ ./kv-client --addr localhost:8003 put proxyKey proxyValue
 Put Success: true, Message: Key successfully replicated and committed
-
-# Node 1 Logs (Follower Proxy):
-2026/06/16 15:39:03 [Node 1] Forwarding Put request to Leader 3
-2026/06/16 15:39:03 [Node 1] Follower updated commitIndex from 1 to 2
-2026/06/16 15:39:03 [Node 1] Applied PUT key: "forwardedKey", value: "forwardedValue" at log index 2
-
-# Node 3 Logs (Leader):
-2026/06/16 15:39:03 [Node 3] Leader appended PUT at log index 2. Key: "forwardedKey"
-2026/06/16 15:39:03 [Node 3] Leader updated commitIndex from 1 to 2
-2026/06/16 15:39:03 [Node 3] Applied PUT key: "forwardedKey", value: "forwardedValue" at log index 2
 ```
 
-### 3. Failover Re-election (Term 2)
-When the active leader is terminated, the followers detect the timeout and re-elect a new leader:
+**Node 2 Logs (Leader):**
 ```log
-# Leader Node 2 is killed. After ~200ms, Node 1 times out:
-2026/06/16 15:19:31 [Node 1] Started election for Term 2
-2026/06/16 15:19:31 [Node 1] Received vote from Peer 3, total votes: 2
-2026/06/16 15:19:31 [Node 1] Became Leader for Term 2!
-
-# Node 3 grants its vote to Node 1:
-2026/06/16 15:19:31 [Node 3] Received RequestVote from Candidate 1 for Term 2. Local Term: 1, votedFor: 2
-2026/06/16 15:19:31 [Node 3] Stepping down to Follower. Term: 1 -> 2
-2026/06/16 15:19:31 [Node 3] Granted vote to Candidate 1 for Term 2
+2026/06/16 16:57:04 [Node 2] Leader appended PUT at log index 2. Key: "proxyKey"
+2026/06/16 16:57:04 [Node 2] Leader updated commitIndex from 1 to 2
+2026/06/16 16:57:04 [Node 2] Applied PUT key: "proxyKey", value: "proxyValue" at log index 2
 ```
